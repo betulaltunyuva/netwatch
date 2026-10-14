@@ -11,3 +11,6 @@ data/*.db-shm
 data/*.db-wal
 exports/*.pcap
 .coverage
+
+# Personal development notes
+GELISTIRMELER.md

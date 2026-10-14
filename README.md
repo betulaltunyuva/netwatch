@@ -253,7 +253,6 @@ Netwatch/
 ├── sniffer.py                 # Packet capture and live statistics
 ├── requirements.txt
 ├── README.md
-├── GELISTIRMELER.md           # Development notes and roadmap (Turkish)
 │
 ├── images/                    # README screenshots
 │
