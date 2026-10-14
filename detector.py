@@ -1,6 +1,12 @@
+import os
 from collections import defaultdict, deque
 from datetime import datetime
 from time import time
+
+from logger import get_logger
+
+
+logger = get_logger(__name__)
 
 
 class ThreatDetector:
@@ -28,7 +34,33 @@ class ThreatDetector:
     # geçmesi gereken süre.
     ALERT_COOLDOWN = 30
 
+    # Aynı IP adresi için farklı bir MAC adresi bu süre
+    # içinde görülürse ARP spoofing şüphesi oluşur.
+    # Daha uzun aralıklar normal IP değişimi (DHCP) sayılır.
+    ARP_SPOOF_WINDOW = 300
+
+    # Eski IP kayıtlarının kaç saniyede bir
+    # bellekten temizleneceğini belirler.
+    STATE_CLEANUP_INTERVAL = 60
+
+    # Ortam değişkeniyle değiştirilebilen eşikler.
+    # Örnek: NETWATCH_PORT_SCAN_PORT_LIMIT=25
+    CONFIGURABLE_SETTINGS = (
+        "PORT_SCAN_WINDOW",
+        "PORT_SCAN_PORT_LIMIT",
+        "SYN_FLOOD_WINDOW",
+        "SYN_FLOOD_PACKET_LIMIT",
+        "ICMP_FLOOD_WINDOW",
+        "ICMP_FLOOD_PACKET_LIMIT",
+        "DNS_TRAFFIC_WINDOW",
+        "DNS_PACKET_LIMIT",
+        "ALERT_COOLDOWN",
+        "ARP_SPOOF_WINDOW",
+    )
+
     def __init__(self):
+        self.load_settings_from_environment()
+
         # Kaynak IP adresinin bağlanmaya çalıştığı
         # hedef portları tutar.
         self.port_attempts = defaultdict(deque)
@@ -47,6 +79,116 @@ class ThreatDetector:
 
         # En son oluşturulan uyarıların zamanlarını tutar.
         self.last_alert_times = {}
+
+        # IP adresi -> (MAC adresi, son görülme zamanı)
+        self.arp_table = {}
+
+        self.last_state_cleanup = time()
+
+    def load_settings_from_environment(self):
+        """
+        NETWATCH_<AYAR_ADI> ortam değişkenlerinde
+        verilen pozitif tam sayıları eşik olarak kullanır.
+        """
+
+        for setting_name in self.CONFIGURABLE_SETTINGS:
+            environment_name = f"NETWATCH_{setting_name}"
+            raw_value = os.environ.get(environment_name)
+
+            if raw_value is None:
+                continue
+
+            try:
+                value = int(raw_value)
+
+            except ValueError:
+                value = 0
+
+            if value <= 0:
+                logger.warning(
+                    "Ignoring invalid %s value: %r",
+                    environment_name,
+                    raw_value
+                )
+
+                continue
+
+            setattr(
+                self,
+                setting_name,
+                value
+            )
+
+    def cleanup_inactive_sources(self, current_time):
+        """
+        Zaman penceresi dolmuş IP adreslerini
+        bellekten siler.
+
+        Bu temizlik yapılmazsa çok sayıda farklı
+        IP adresi gören uzun çalışan bir uygulamada
+        bellek kullanımı sürekli artar.
+        """
+
+        tracked_events = (
+            (
+                self.port_attempts,
+                self.PORT_SCAN_WINDOW,
+                lambda event: event[0]
+            ),
+            (
+                self.syn_packets,
+                self.SYN_FLOOD_WINDOW,
+                lambda event: event
+            ),
+            (
+                self.icmp_packets,
+                self.ICMP_FLOOD_WINDOW,
+                lambda event: event
+            ),
+            (
+                self.dns_packets,
+                self.DNS_TRAFFIC_WINDOW,
+                lambda event: event
+            ),
+        )
+
+        for events_by_ip, window, get_time in tracked_events:
+            minimum_time = current_time - window
+
+            inactive_ips = [
+                source_ip
+                for source_ip, event_queue
+                in events_by_ip.items()
+                if (
+                    not event_queue
+                    or get_time(event_queue[-1]) < minimum_time
+                )
+            ]
+
+            for source_ip in inactive_ips:
+                del events_by_ip[source_ip]
+
+        expired_alerts = [
+            alert_key
+            for alert_key, alert_time
+            in self.last_alert_times.items()
+            if current_time - alert_time >= self.ALERT_COOLDOWN
+        ]
+
+        for alert_key in expired_alerts:
+            del self.last_alert_times[alert_key]
+
+        expired_arp_entries = [
+            ip_value
+            for ip_value, (_, seen_time)
+            in self.arp_table.items()
+            if current_time - seen_time >= self.ARP_SPOOF_WINDOW
+        ]
+
+        for ip_value in expired_arp_entries:
+            del self.arp_table[ip_value]
+
+        self.last_state_cleanup = current_time
 
     def remove_old_times(self, event_queue, current_time, window):
         """
@@ -344,6 +486,65 @@ class ThreatDetector:
 
         return None
 
+    def analyze_arp_reply(
+        self,
+        ip_value,
+        mac_address,
+        current_time=None
+    ):
+        """
+        ARP yanıtındaki IP-MAC eşleşmesini kontrol eder.
+
+        Aynı IP adresi kısa süre içinde farklı bir MAC
+        adresiyle duyurulursa, biri ağ trafiğini kendi
+        üzerine yönlendirmeye çalışıyor olabilir.
+        """
+
+        if not ip_value or not mac_address:
+            return None
+
+        if current_time is None:
+            current_time = time()
+
+        mac_address = str(mac_address).upper()
+
+        previous_entry = self.arp_table.get(ip_value)
+
+        self.arp_table[ip_value] = (
+            mac_address,
+            current_time
+        )
+
+        if previous_entry is None:
+            return None
+
+        previous_mac, previous_time = previous_entry
+
+        if (
+            previous_mac == mac_address
+            or current_time - previous_time
+            >= self.ARP_SPOOF_WINDOW
+        ):
+            return None
+
+        if not self.can_create_alert(
+            "ARP_SPOOFING",
+            ip_value,
+            current_time
+        ):
+            return None
+
+        return self.create_alert(
+            alert_type="ARP_SPOOFING",
+            severity="HIGH",
+            message=(
+                "Possible ARP spoofing detected. "
+                f"{ip_value} changed from MAC "
+                f"{previous_mac} to {mac_address}."
+            ),
+            source_ip=ip_value
+        )
+
     def analyze_packet(
         self,
         source_ip,
@@ -359,6 +560,14 @@ class ThreatDetector:
 
         current_time = time()
         detected_alerts = []
+
+        if (
+            current_time - self.last_state_cleanup
+            >= self.STATE_CLEANUP_INTERVAL
+        ):
+            self.cleanup_inactive_sources(
+                current_time
+            )
 
         if protocol == "TCP":
             port_scan_alert = self.detect_port_scan(

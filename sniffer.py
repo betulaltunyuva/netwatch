@@ -1,3 +1,4 @@
+import os
 from collections import Counter, deque
 from datetime import datetime
 from threading import Lock
@@ -14,10 +15,12 @@ logger = get_logger(__name__)
 
 try:
     from scapy.all import (
+        ARP,
         AsyncSniffer,
         Ether,
         ICMP,
         IP,
+        IPv6,
         TCP,
         UDP
     )
@@ -47,8 +50,23 @@ class NetworkMonitor:
     DATABASE_BATCH_SIZE = 100
     DATABASE_FLUSH_INTERVAL = 1
 
-    def __init__(self):
+    # Yakalama başladıktan sonra hata kontrolü
+    # için beklenecek süre (saniye).
+    CAPTURE_STARTUP_CHECK = 1
+
+    def __init__(self, interface=None):
         self.lock = Lock()
+
+        # Dinlenecek ağ arayüzü. Boş bırakılırsa
+        # Scapy varsayılan arayüzü kullanır.
+        self.interface = (
+            interface
+            or os.environ.get(
+                "NETWATCH_INTERFACE",
+                ""
+            ).strip()
+            or None
+        )
 
         self.sniffer = None
         self.running = False
@@ -81,6 +99,9 @@ class NetworkMonitor:
 
         self.device_last_updates = {}
 
+        # İşlenirken hata veren ve atlanan paket sayısı.
+        self.skipped_packets = 0
+
         # Veritabanına kaydedilmeyi bekleyen veriler.
         self.pending_packets = []
         self.pending_alerts = []
@@ -104,19 +125,43 @@ class NetworkMonitor:
             return False
 
         try:
+            sniffer_options = {
+                "prn": self.process_packet,
+                "store": False,
+            }
+
+            if self.interface:
+                sniffer_options["iface"] = (
+                    self.interface
+                )
+
             self.sniffer = AsyncSniffer(
-                prn=self.process_packet,
-                store=False
+                **sniffer_options
             )
 
             self.sniffer.start()
+
+            # AsyncSniffer hataları arka plandaki
+            # thread içinde yakalar ve start() hata
+            # vermez. Npcap eksikliği veya yetki hatası
+            # gibi sorunları görmek için kısa süre bekler.
+            # Thread hata ile durduysa join() hatayı fırlatır.
+            self.sniffer.join(
+                timeout=self.CAPTURE_STARTUP_CHECK
+            )
+
+            if not self.is_capture_thread_alive():
+                raise RuntimeError(
+                    "Packet capture thread stopped unexpectedly."
+                )
 
             self.running = True
             self.sample_mode = False
             self.capture_error = None
 
             logger.info(
-                "Live packet capture started."
+                "Live packet capture started on %s.",
+                self.interface or "the default interface"
             )
 
             return True
@@ -134,6 +179,59 @@ class NetworkMonitor:
             )
 
             return False
+
+    def is_capture_thread_alive(self):
+        """
+        Paket yakalama thread'inin hâlâ
+        çalışıp çalışmadığını kontrol eder.
+        """
+
+        if self.sniffer is None:
+            return False
+
+        capture_thread = getattr(
+            self.sniffer,
+            "thread",
+            None
+        )
+
+        return (
+            capture_thread is not None
+            and capture_thread.is_alive()
+        )
+
+    def check_capture_health(self):
+        """
+        Yakalama sonradan beklenmedik şekilde
+        durduysa durumu ve hata mesajını günceller.
+        """
+
+        if (
+            not self.running
+            or self.is_capture_thread_alive()
+        ):
+            return
+
+        self.running = False
+
+        error = getattr(
+            self.sniffer,
+            "exception",
+            None
+        )
+
+        self.capture_error = (
+            "Packet capture stopped unexpectedly"
+            + (
+                f": {error}"
+                if error
+                else "."
+            )
+        )
+
+        logger.error(
+            self.capture_error
+        )
 
     def activate_sample_mode(self, reason):
         """
@@ -291,9 +389,38 @@ class NetworkMonitor:
             )
 
     def process_packet(self, packet):
-        """Yakalanan her ağ paketi için çalışır."""
+        """
+        Yakalanan her ağ paketi için çalışır.
 
-        if not packet.haslayer(IP):
+        Scapy, prn fonksiyonunda oluşan bir hatada
+        yakalamayı tamamen durdurur. Bu yüzden tek bir
+        bozuk paket yalnızca günlüğe yazılır ve atlanır.
+        """
+
+        try:
+            self.handle_packet(packet)
+
+        except Exception:
+            self.skipped_packets += 1
+
+            logger.exception(
+                "Packet could not be processed and was skipped"
+            )
+
+    def handle_packet(self, packet):
+        """Bir paketi analiz eder ve sayaçları günceller."""
+
+        if packet.haslayer(ARP):
+            self.handle_arp_packet(packet)
+            return
+
+        if packet.haslayer(IP):
+            ip_layer = packet[IP]
+
+        elif packet.haslayer(IPv6):
+            ip_layer = packet[IPv6]
+
+        else:
             return
 
         captured_at = datetime.now()
@@ -301,8 +428,6 @@ class NetworkMonitor:
         captured_at_text = captured_at.strftime(
             "%Y-%m-%d %H:%M:%S"
         )
-
-        ip_layer = packet[IP]
 
         protocol = "OTHER"
         source_port = None
@@ -341,7 +466,7 @@ class NetworkMonitor:
                 packet[UDP].dport
             )
 
-        elif packet.haslayer(ICMP):
+        elif is_icmp_packet(packet):
             protocol = "ICMP"
 
         packet_record = {
@@ -390,6 +515,10 @@ class NetworkMonitor:
                 "Packet threat analysis failed"
             )
 
+        # Kopyalama yavaş bir işlemdir; kilidi
+        # tutmadan önce yapılır.
+        raw_packet = packet.copy()
+
         with self.lock:
             self.total_packets += 1
 
@@ -429,12 +558,54 @@ class NetworkMonitor:
             )
 
             self.raw_packets.append(
-                packet.copy()
+                raw_packet
             )
 
             self.last_updated = captured_at
 
-        self.flush_database()
+        # Veritabanına yazma işlemi yakalama thread'ini
+        # yavaşlatmasın diye burada yapılmaz; app.py
+        # içindeki arka plan döngüsü her saniye kaydeder.
+
+    def handle_arp_packet(self, packet):
+        """
+        ARP yanıtlarını (is-at) ARP spoofing
+        kuralına göre kontrol eder.
+        """
+
+        arp_layer = packet[ARP]
+
+        # 2 = is-at (yanıt). İstekler kontrol edilmez.
+        if int(arp_layer.op) != 2:
+            return
+
+        try:
+            alert = threat_detector.analyze_arp_reply(
+                ip_value=str(arp_layer.psrc),
+                mac_address=str(arp_layer.hwsrc)
+            )
+
+            self.detector_error = None
+
+        except Exception as error:
+            alert = None
+            self.detector_error = str(error)
+
+            logger.exception(
+                "ARP analysis failed"
+            )
+
+        if alert is None:
+            return
+
+        with self.lock:
+            self.security_alerts.appendleft(
+                alert
+            )
+
+            self.pending_alerts.append(
+                alert
+            )
 
     def flush_database(self, force=False):
         """
@@ -452,7 +623,10 @@ class NetworkMonitor:
                     >= self.DATABASE_BATCH_SIZE
                 )
                 or (
-                    self.pending_packets
+                    (
+                        self.pending_packets
+                        or self.pending_alerts
+                    )
                     and (
                         current_time
                         - self.last_database_flush
@@ -538,6 +712,8 @@ class NetworkMonitor:
     def get_summary(self):
         """Canlı dashboard verilerini oluşturur."""
 
+        self.check_capture_health()
+
         with self.lock:
             total_packets = (
                 self.total_packets
@@ -612,6 +788,13 @@ class NetworkMonitor:
                 f"{self.device_error}"
             )
 
+        if self.skipped_packets:
+            alert_messages.append(
+                f"{self.skipped_packets} packets could not "
+                "be processed and were skipped. "
+                "See logs/netwatch.log for details."
+            )
+
         for alert in security_alerts:
             alert_messages.append(
                 f"[{alert['severity']}] "
@@ -648,26 +831,36 @@ class NetworkMonitor:
             "tcp_packets": tcp_packets,
             "udp_packets": udp_packets,
             "icmp_packets": icmp_packets,
+            "skipped_packets": self.skipped_packets,
             "alerts": alert_messages,
             "top_sources": top_sources,
             "top_ports": top_ports,
             "recent_packets": recent_packets,
             "last_updated": last_updated,
             "data_mode": data_mode,
+            "interface": (
+                self.interface
+                or "default"
+            ),
         }
+
+
+def is_icmp_packet(packet):
+    """
+    Paketin ICMP (IPv4) veya ICMPv6
+    içerip içermediğini kontrol eder.
+    """
+
+    if packet.haslayer(ICMP):
+        return True
+
+    # Scapy her ICMPv6 mesaj türü için ayrı bir
+    # katman sınıfı kullanır (ICMPv6EchoRequest vb.).
+    return any(
+        layer.__name__.startswith("ICMPv6")
+        for layer in packet.layers()
+    )
 
 
 # Uygulama boyunca kullanılacak tek ağ izleyicisi.
 monitor = NetworkMonitor()
-
-
-def get_live_summary(packet_count=50):
-    """Eski kodlarla uyumluluk sağlar."""
-
-    if (
-        not monitor.running
-        and not monitor.sample_mode
-    ):
-        monitor.start()
-
-    return monitor.get_summary()

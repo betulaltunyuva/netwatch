@@ -1,16 +1,27 @@
+import os
 import sqlite3
+from datetime import datetime, timedelta
 from pathlib import Path
 
 
 BASE_DIR = Path(__file__).resolve().parent
-DATA_DIR = BASE_DIR / "data"
+
+# Veritabanı klasörü NETWATCH_DATA_DIR ortam
+# değişkeniyle değiştirilebilir.
+DATA_DIR = Path(
+    os.environ.get("NETWATCH_DATA_DIR", "").strip()
+    or BASE_DIR / "data"
+)
 DATABASE_PATH = DATA_DIR / "netwatch.db"
 
 
 def get_connection():
     """SQLite veritabanına bağlantı oluşturur."""
 
-    DATA_DIR.mkdir(exist_ok=True)
+    DATA_DIR.mkdir(
+        parents=True,
+        exist_ok=True
+    )
 
     connection = sqlite3.connect(
         DATABASE_PATH,
@@ -69,7 +80,8 @@ def init_database():
                 ip_address TEXT NOT NULL UNIQUE,
                 mac_address TEXT,
                 first_seen TEXT NOT NULL,
-                last_seen TEXT NOT NULL
+                last_seen TEXT NOT NULL,
+                packet_count INTEGER NOT NULL DEFAULT 0
             );
 
             CREATE TABLE IF NOT EXISTS settings (
@@ -99,6 +111,95 @@ def init_database():
                 ON alerts(alert_type);
             """
         )
+
+        migrate_device_packet_count(
+            connection
+        )
+
+
+# Bir cihazın kaynak veya hedef olduğu paketleri sayar.
+# İki ayrı sorgu kullanılır; böylece her biri kendi
+# indeksini kullanabilir.
+DEVICE_PACKET_COUNT_SQL = """
+    (
+        SELECT COUNT(*)
+        FROM packets
+        WHERE packets.source_ip = devices.ip_address
+    )
+    +
+    (
+        SELECT COUNT(*)
+        FROM packets
+        WHERE packets.destination_ip = devices.ip_address
+            AND packets.source_ip != devices.ip_address
+    )
+"""
+
+
+def migrate_device_packet_count(connection):
+    """
+    Eski veritabanlarına packet_count sütununu ekler
+    ve mevcut paketlerden ilk değerleri hesaplar.
+    """
+
+    columns = {
+        row["name"]
+        for row in connection.execute(
+            "PRAGMA table_info(devices)"
+        )
+    }
+
+    if "packet_count" in columns:
+        return
+
+    connection.execute(
+        """
+        ALTER TABLE devices
+        ADD COLUMN packet_count INTEGER NOT NULL DEFAULT 0
+        """
+    )
+
+    recalculate_device_packet_counts(
+        connection
+    )
+
+
+def recalculate_device_packet_counts(connection):
+    """
+    Cihazların paket sayılarını packets
+    tablosundan yeniden hesaplar.
+    """
+
+    connection.execute(
+        f"""
+        UPDATE devices
+        SET packet_count = {DEVICE_PACKET_COUNT_SQL}
+        """
+    )
+
+
+def count_packets_by_ip(packets):
+    """
+    Her IP adresinin kaç pakette kaynak veya
+    hedef olarak geçtiğini sayar.
+    """
+
+    counts = {}
+
+    for packet in packets:
+        source_ip = packet["source_ip"]
+        destination_ip = packet["destination_ip"]
+
+        counts[source_ip] = (
+            counts.get(source_ip, 0) + 1
+        )
+
+        if destination_ip != source_ip:
+            counts[destination_ip] = (
+                counts.get(destination_ip, 0) + 1
+            )
+
+    return counts
 
 
 def save_packets(packets):
@@ -130,6 +231,23 @@ def save_packets(packets):
             )
             """,
             packets
+        )
+
+        # Cihaz sayfasının her açılışta bütün paket
+        # tablosunu taramaması için sayaç güncellenir.
+        # Cihaz olarak kayıtlı olmayan IP adresleri
+        # için UPDATE hiçbir satırı etkilemez.
+        connection.executemany(
+            """
+            UPDATE devices
+            SET packet_count = packet_count + ?
+            WHERE ip_address = ?
+            """,
+            [
+                (count, ip_value)
+                for ip_value, count
+                in count_packets_by_ip(packets).items()
+            ]
         )
 
 
@@ -259,10 +377,57 @@ def get_traffic_history(minutes=60):
             (time_modifier,)
         ).fetchall()
 
-        return [
+    return fill_missing_minutes(
+        [
             dict(row)
             for row in rows
-        ]
+        ],
+        minutes
+    )
+
+
+def fill_missing_minutes(timeline, minutes, now=None):
+    """
+    Paket görülmeyen dakikaları sıfır değerleriyle
+    ekler. Böylece grafik boş aralıkları atlamak
+    yerine sıfıra düşer.
+    """
+
+    if now is None:
+        now = datetime.now()
+
+    rows_by_label = {
+        row["time_label"]: row
+        for row in timeline
+    }
+
+    current_minute = now.replace(
+        second=0,
+        microsecond=0
+    )
+
+    filled_timeline = []
+
+    for offset in range(minutes, -1, -1):
+        time_label = (
+            current_minute
+            - timedelta(minutes=offset)
+        ).strftime("%Y-%m-%d %H:%M")
+
+        filled_timeline.append(
+            rows_by_label.get(
+                time_label,
+                {
+                    "time_label": time_label,
+                    "total_packets": 0,
+                    "tcp_packets": 0,
+                    "udp_packets": 0,
+                    "icmp_packets": 0,
+                }
+            )
+        )
+
+    return filled_timeline
 
 
 def get_history_summary(minutes=60):
@@ -480,8 +645,8 @@ def normalize_retention_days(days):
 
 def cleanup_old_records(days=30):
     """
-    Seçilen süreden eski paket ve
-    güvenlik uyarısı kayıtlarını temizler.
+    Seçilen süreden eski paket, güvenlik
+    uyarısı ve cihaz kayıtlarını temizler.
     """
 
     days = normalize_retention_days(days)
@@ -512,11 +677,33 @@ def cleanup_old_records(days=30):
             (time_modifier,)
         )
 
+        # Saklama süresi boyunca hiç görülmeyen
+        # cihazlar da listeden kaldırılır.
+        device_cursor = connection.execute(
+            """
+            DELETE FROM devices
+            WHERE last_seen < datetime(
+                'now',
+                'localtime',
+                ?
+            )
+            """,
+            (time_modifier,)
+        )
+
         deleted_packets = packet_cursor.rowcount
         deleted_alerts = alert_cursor.rowcount
+        deleted_devices = device_cursor.rowcount
+
+        # Silinen paketler cihaz sayaçlarından da düşülür.
+        if deleted_packets:
+            recalculate_device_packet_counts(
+                connection
+            )
 
     return {
         "retention_days": days,
         "deleted_packets": deleted_packets,
         "deleted_alerts": deleted_alerts,
+        "deleted_devices": deleted_devices,
     }

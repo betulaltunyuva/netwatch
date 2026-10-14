@@ -1,5 +1,7 @@
+import sqlite3
 import tempfile
 import unittest
+from datetime import datetime
 from pathlib import Path
 
 import database
@@ -148,6 +150,15 @@ class DatabaseTests(unittest.TestCase):
             ]
         )
 
+        register_device(
+            "192.168.1.20",
+            seen_at="2000-01-01 00:00:00"
+        )
+
+        register_device(
+            "192.168.1.21"
+        )
+
         result = database.cleanup_old_records(
             days=30
         )
@@ -158,8 +169,138 @@ class DatabaseTests(unittest.TestCase):
         )
 
         self.assertEqual(
+            result["deleted_devices"],
+            1
+        )
+
+        self.assertEqual(
+            [
+                device["ip_address"]
+                for device in get_devices_data()[
+                    "devices"
+                ]
+            ],
+            ["192.168.1.21"]
+        )
+
+        self.assertEqual(
             database.get_packet_count(),
             1
+        )
+
+    def test_device_packet_count_is_updated_on_save(self):
+        register_device(
+            "192.168.1.30"
+        )
+
+        packet = {
+            "captured_at": "2026-09-12 12:00:00",
+            "source_ip": "192.168.1.30",
+            "destination_ip": "8.8.8.8",
+            "protocol": "UDP",
+            "source_port": 50000,
+            "destination_port": 53,
+            "packet_length": 60
+        }
+
+        reply = dict(
+            packet,
+            source_ip="8.8.8.8",
+            destination_ip="192.168.1.30"
+        )
+
+        database.save_packets(
+            [packet, packet, reply]
+        )
+
+        device = get_devices_data()["devices"][0]
+
+        self.assertEqual(
+            device["packet_count"],
+            3
+        )
+
+    def test_old_database_gets_packet_count_column(self):
+        # packet_count sütunu olmayan eski şemayı oluşturur.
+        old_database = (
+            database.DATA_DIR / "old.db"
+        )
+
+        connection = sqlite3.connect(old_database)
+
+        connection.executescript(
+            """
+            CREATE TABLE devices (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                ip_address TEXT NOT NULL UNIQUE,
+                mac_address TEXT,
+                first_seen TEXT NOT NULL,
+                last_seen TEXT NOT NULL
+            );
+
+            INSERT INTO devices (
+                ip_address, first_seen, last_seen
+            )
+            VALUES (
+                '10.0.0.7',
+                '2026-09-12 12:00:00',
+                '2026-09-12 12:00:00'
+            );
+            """
+        )
+
+        connection.close()
+
+        database.DATABASE_PATH = old_database
+        database.init_database()
+
+        database.save_packets(
+            [
+                {
+                    "captured_at": "2026-09-12 12:00:00",
+                    "source_ip": "10.0.0.7",
+                    "destination_ip": "10.0.0.8",
+                    "protocol": "TCP",
+                    "source_port": 1000,
+                    "destination_port": 80,
+                    "packet_length": 40
+                }
+            ]
+        )
+
+        self.assertEqual(
+            get_devices_data()["devices"][0][
+                "packet_count"
+            ],
+            1
+        )
+
+    def test_missing_minutes_are_filled_with_zero(self):
+        timeline = database.fill_missing_minutes(
+            [
+                {
+                    "time_label": "2026-09-12 12:01",
+                    "total_packets": 4,
+                    "tcp_packets": 4,
+                    "udp_packets": 0,
+                    "icmp_packets": 0
+                }
+            ],
+            minutes=3,
+            now=datetime(2026, 9, 12, 12, 3, 30)
+        )
+
+        self.assertEqual(
+            [
+                (row["time_label"], row["total_packets"])
+                for row in timeline
+            ],
+            [
+                ("2026-09-12 12:00", 0),
+                ("2026-09-12 12:01", 4),
+                ("2026-09-12 12:02", 0),
+                ("2026-09-12 12:03", 0)
+            ]
         )
 
 

@@ -180,18 +180,7 @@ def get_devices():
                 devices.mac_address,
                 devices.first_seen,
                 devices.last_seen,
-
-                (
-                    SELECT COUNT(*)
-                    FROM packets
-
-                    WHERE
-                        packets.source_ip =
-                            devices.ip_address
-
-                        OR packets.destination_ip =
-                            devices.ip_address
-                ) AS packet_count
+                devices.packet_count
 
             FROM devices
 

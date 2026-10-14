@@ -238,6 +238,9 @@ h1 {
 .stats-table td {
     color: #f8fafc;
     line-height: 1.4;
+
+    /* Uzun IPv6 adreslerinin tabloyu taşırmasını engeller. */
+    overflow-wrap: anywhere;
 }
 
 .stats-table tbody tr {

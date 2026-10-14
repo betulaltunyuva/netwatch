@@ -261,14 +261,14 @@
                 <h2>Database Cleanup</h2>
 
                 <p>
-                    Delete packet and alert records older than
+                    Delete packet, alert and inactive device records older than
                     the selected retention period.
                 </p>
 
                 <ul>
                     <li>Prevents unlimited database growth</li>
                     <li>Keeps recent records available</li>
-                    <li>Does not delete known devices</li>
+                    <li>Removes devices inactive for the whole period</li>
                     <li>Requires confirmation</li>
                 </ul>
 
@@ -481,7 +481,7 @@
                 Number(select.value) || 30;
 
             const confirmed = window.confirm(
-                "Delete packet and alert records older than " +
+                "Delete packet, alert and inactive device records older than " +
                 retentionDays +
                 " days?"
             );
@@ -526,7 +526,11 @@
                     formatNumber(
                         data.deleted_alerts
                     ) +
-                    " alerts deleted.";
+                    " alerts and " +
+                    formatNumber(
+                        data.deleted_devices
+                    ) +
+                    " inactive devices deleted.";
 
                 await loadExportInformation();
 
