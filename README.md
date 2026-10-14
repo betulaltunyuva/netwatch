@@ -56,17 +56,22 @@ If live packet capture cannot be started, the application detects the problem an
 
 ## 📸 Screenshots
 
-### Live Dashboard
-
-![Live Dashboard](images/netwatch1.png)
-
-### Traffic History
-
-![Traffic History](images/netwatch2.png)
-
-### Data Export
-
-![Data Export](images/netwatch3.png)
+<table>
+  <tr>
+    <td width="50%"><img src="images/netwatch1.png" width="410" alt="Live Dashboard with total, TCP, UDP and ICMP packet counts, live data badge and alerts"></td>
+    <td width="50%"><img src="images/netwatch2.png" width="410" alt="Traffic History with time range buttons, protocol totals, transferred data and traffic-over-time chart"></td>
+  </tr>
+  <tr>
+    <td align="center"><b>📡 Live Dashboard</b> — real-time packet counts, data mode and security alerts</td>
+    <td align="center"><b>🕒 Traffic History</b> — per-minute traffic chart and protocol totals</td>
+  </tr>
+  <tr>
+    <td colspan="2" align="center"><img src="images/netwatch3.png" width="410" alt="Data Export page with packet CSV, alert CSV, PCAP download and database cleanup cards"></td>
+  </tr>
+  <tr>
+    <td colspan="2" align="center"><b>📤 Data Export</b> — CSV and PCAP downloads and database cleanup</td>
+  </tr>
+</table>
 
 ---
 
